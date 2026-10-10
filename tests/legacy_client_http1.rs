@@ -23,13 +23,102 @@ use hyper::Request;
 use hyper::body::Bytes;
 use hyper::body::Frame;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::{HttpConnector, capture_connection};
+use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo, capture_connection};
 use hyper_util::rt::TokioExecutor;
 
 use test_utils::{DebugConnector, DebugStream, runtime};
 
 fn s(buf: &[u8]) -> &str {
     std::str::from_utf8(buf).expect("from_utf8")
+}
+
+#[cfg(not(miri))]
+async fn assert_http_info(connector: HttpConnector, enabled: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let uri: hyper::Uri = format!("http://{addr}/").parse().unwrap();
+
+    let server = async {
+        // Both requests must use this connection, exercising pooled metadata.
+        let (stream, client_addr) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(stream),
+                hyper::service::service_fn(|_| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Empty::<Bytes>::new()))
+                }),
+            )
+            .await
+            .unwrap();
+        client_addr
+    };
+
+    let requests = async {
+        let client: Client<_, Empty<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
+        let mut infos = Vec::new();
+
+        for _ in 0..2 {
+            let response = client.get(uri.clone()).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            infos.push(response.extensions().get::<HttpInfo>().cloned());
+            response.into_body().collect().await.unwrap();
+        }
+
+        infos
+    };
+
+    let (client_addr, infos) =
+        tokio::time::timeout(Duration::from_secs(5), future::join(server, requests))
+            .await
+            .expect("requests should complete on the same connection");
+
+    for info in infos {
+        if enabled {
+            let info = info.expect("HttpConnector should set HttpInfo");
+            assert_eq!(info.remote_addr(), addr);
+            assert_eq!(info.local_addr(), client_addr);
+        } else {
+            assert!(info.is_none(), "HttpInfo should be disabled");
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[tokio::test]
+async fn http_info_enabled_by_default() {
+    assert_http_info(HttpConnector::new(), true).await;
+}
+
+#[cfg(not(miri))]
+#[tokio::test]
+async fn http_info_enabled() {
+    let mut connector = HttpConnector::new();
+    connector.set_http_info(false);
+    connector.set_http_info(true);
+    assert_http_info(connector, true).await;
+}
+
+#[cfg(not(miri))]
+#[tokio::test]
+async fn http_info_disabled() {
+    let mut connector = HttpConnector::new();
+    connector.set_http_info(false);
+    assert_http_info(connector, false).await;
+}
+
+#[cfg(not(miri))]
+#[tokio::test]
+async fn http_info_cloned_connectors_are_independent() {
+    let mut connector = HttpConnector::new();
+    let enabled = connector.clone();
+    connector.set_http_info(false);
+    let disabled = connector.clone();
+    connector.set_http_info(true);
+
+    assert_http_info(enabled, true).await;
+    assert_http_info(disabled, false).await;
+    assert_http_info(connector, true).await;
 }
 
 #[cfg(not(miri))]

@@ -26,8 +26,9 @@ use crate::rt::TokioIo;
 ///
 /// # Note
 ///
-/// Sets the [`HttpInfo`](HttpInfo) value on responses, which includes
+/// By default, sets the [`HttpInfo`](HttpInfo) value on responses, which includes
 /// transport information such as the remote socket address used.
+/// This can be disabled with [`HttpConnector::set_http_info`].
 #[derive(Clone)]
 pub struct HttpConnector<R = GaiResolver> {
     config: Arc<Config>,
@@ -57,6 +58,7 @@ pub struct HttpConnector<R = GaiResolver> {
 /// If a different connector is used besides [`HttpConnector`](HttpConnector),
 /// this value will not exist in the extensions. Consult that specific
 /// connector to see what "extra" information it might provide to responses.
+/// This value is also absent when [`HttpConnector::set_http_info`] is disabled.
 #[derive(Clone, Debug)]
 pub struct HttpInfo {
     remote_addr: SocketAddr,
@@ -68,6 +70,7 @@ struct Config {
     connect_timeout: Option<Duration>,
     enforce_http: bool,
     happy_eyeballs_timeout: Option<Duration>,
+    http_info: bool,
     tcp_keepalive_config: TcpKeepaliveConfig,
     local_address_ipv4: Option<Ipv4Addr>,
     local_address_ipv6: Option<Ipv6Addr>,
@@ -226,6 +229,7 @@ impl<R> HttpConnector<R> {
                 connect_timeout: None,
                 enforce_http: true,
                 happy_eyeballs_timeout: Some(Duration::from_millis(300)),
+                http_info: true,
                 tcp_keepalive_config: TcpKeepaliveConfig::default(),
                 local_address_ipv4: None,
                 local_address_ipv6: None,
@@ -261,6 +265,17 @@ impl<R> HttpConnector<R> {
     #[inline]
     pub fn enforce_http(&mut self, is_enforced: bool) {
         self.config_mut().enforce_http = is_enforced;
+    }
+
+    /// Set whether to include [`HttpInfo`] in response extensions.
+    ///
+    /// When disabled, the local and remote socket addresses are not queried
+    /// for connection metadata. This setting applies to newly created connections.
+    ///
+    /// Default is `true`.
+    #[inline]
+    pub fn set_http_info(&mut self, enabled: bool) {
+        self.config_mut().http_info = enabled;
     }
 
     /// Set that all sockets have `SO_KEEPALIVE` set with the supplied duration
@@ -580,7 +595,9 @@ where
             warn!("tcp set_nodelay error: {}", e);
         }
 
-        Ok(TokioIo::new(sock))
+        let mut io = TokioIo::new(sock);
+        io.config.skip_connection_info = !config.http_info;
+        Ok(io)
     }
 }
 
@@ -619,7 +636,11 @@ where
     T: Connection,
 {
     fn connected(&self) -> Connected {
-        self.inner().connected()
+        if self.config.skip_connection_info {
+            Connected::new()
+        } else {
+            self.inner().connected()
+        }
     }
 }
 
@@ -1025,9 +1046,10 @@ mod tests {
     use ::http::Uri;
 
     use crate::client::legacy::connect::http::TcpKeepaliveConfig;
+    use crate::rt::TokioIo;
 
     use super::super::sealed::{Connect, ConnectSvc};
-    use super::HttpConnector;
+    use super::{Connected, Connection, HttpConnector};
 
     use super::set_port;
 
@@ -1048,6 +1070,44 @@ mod tests {
 
         let err = connect(connector, dst).await.unwrap_err();
         assert_eq!(&*err.msg, super::INVALID_NOT_HTTP);
+    }
+
+    #[test]
+    fn tokio_io_preserves_custom_connection_metadata() {
+        struct CustomConnection;
+
+        impl Connection for CustomConnection {
+            fn connected(&self) -> Connected {
+                Connected::new().proxy(true).negotiated_h2().extra(42u32)
+            }
+        }
+
+        let connected = TokioIo::new(CustomConnection).connected();
+        let mut extras = ::http::Extensions::new();
+        connected.get_extras(&mut extras);
+
+        assert!(connected.is_proxied());
+        assert!(connected.is_negotiated_h2());
+        assert_eq!(extras.get::<u32>(), Some(&42));
+    }
+
+    #[test]
+    fn tokio_io_skips_collecting_connection_metadata() {
+        struct UnexpectedConnection;
+
+        impl Connection for UnexpectedConnection {
+            fn connected(&self) -> Connected {
+                panic!("connection metadata should not be collected");
+            }
+        }
+
+        let mut io = TokioIo::new(UnexpectedConnection);
+        io.config.skip_connection_info = true;
+        let connected = io.connected();
+        let mut extras = ::http::Extensions::new();
+        connected.get_extras(&mut extras);
+
+        assert!(extras.is_empty());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

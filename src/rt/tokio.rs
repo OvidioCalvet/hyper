@@ -78,7 +78,16 @@ pin_project! {
     pub struct TokioIo<T> {
         #[pin]
         inner: T,
+        pub(crate) config: TokioIoConfig,
     }
+}
+
+// Keep feature-gated fields outside pin_project!, which does not support them.
+#[derive(Debug, Default)]
+pub(crate) struct TokioIoConfig {
+    // HttpConnector can skip TCP address lookups while preserving its IO type.
+    #[cfg(feature = "client-legacy")]
+    pub(crate) skip_connection_info: bool,
 }
 
 /// A Timer that uses the tokio runtime.
@@ -101,7 +110,10 @@ pin_project! {
 impl<T> TokioIo<T> {
     /// Wrap a type implementing Tokio's or hyper's IO traits.
     pub fn new(inner: T) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            config: TokioIoConfig::default(),
+        }
     }
 
     /// Borrow the inner type.
